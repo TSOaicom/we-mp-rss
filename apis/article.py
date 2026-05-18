@@ -167,6 +167,8 @@ async def clean_orphan_articles(
                 message="清理无效文章失败"
             )
         )
+    finally:
+        session.close()
 
 
 @router.delete("/clean-old", summary="清理指定天数前的旧文章")
