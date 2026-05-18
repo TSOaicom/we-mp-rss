@@ -368,9 +368,16 @@ class TaskQueueManager:
                 max_retries=max_retries
             ))
             
-            # 保存到 Redis
-            self._save_pending_to_redis()
-            self._save_status_to_redis()
+            # 优化：只追加新任务到 Redis，而不是全量重写
+            redis_client = _get_redis()
+            if redis_client:
+                try:
+                    new_item = self._pending_items[-1].to_dict()
+                    redis_client.rpush(self._redis_keys['pending'], json.dumps(new_item, ensure_ascii=False))
+                    # 只更新计数，不保存完整状态
+                    redis_client.hincrby(self._redis_keys['status'], 'pending_count', 1)
+                except Exception as e:
+                    print_error(f"追加任务到 Redis 失败: {e}")
             
             # 标记需要广播，但不在这里执行（避免在锁内进行异步操作）
             broadcast_needed = True
