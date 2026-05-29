@@ -6,6 +6,7 @@ import json
 from typing import Callable, Any, Optional
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from core.print import print_error, print_info, print_warning, print_success
 
 # Redis 键前缀 - 主队列（文章列表采集）
@@ -457,7 +458,15 @@ class TaskQueueManager:
                         try:
                             # 记录任务开始时间
                             start_time = time.time()
-                            task(*args, **kwargs)
+                            task_executor = ThreadPoolExecutor(max_workers=1)
+                            try:
+                                future = task_executor.submit(task, *args, **kwargs)
+                                future.result(timeout=600)
+                            except FutureTimeoutError:
+                                print_error("Task [{}] execution timeout (10 min)".format(task_name))
+                                raise Exception("Task timed out after 600s")
+                            finally:
+                                task_executor.shutdown(wait=False)
                             # 记录任务执行时间
                             duration = time.time() - start_time
                             
