@@ -53,14 +53,48 @@ def get_token_status() -> Dict:
     }
 
 
+def _resolve_short_url(url: str) -> str:
+    """
+    解析微信短链接，获取重定向后的完整URL
+    
+    微信文章短链接格式: https://mp.weixin.qq.com/s/XXXX
+    完整链接格式: https://mp.weixin.qq.com/s?__biz=XXX&mid=XXX&idx=XXX&sn=XXX&...
+    """
+    try:
+        # 如果已经有完整参数，直接返回
+        if "__biz=" in url and "mid=" in url:
+            return url
+        
+        # 跟随重定向获取完整URL（不下载body，只取Location头）
+        resp = requests.head(url, allow_redirects=True, timeout=10,
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        final_url = resp.url
+        
+        # 如果head没拿到完整URL，尝试GET
+        if "__biz=" not in final_url:
+            resp = requests.get(url, allow_redirects=True, timeout=10, stream=True,
+                               headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            final_url = resp.url
+            resp.close()
+        
+        return final_url
+    except Exception:
+        return url
+
+
 def _parse_article_url(url: str) -> Optional[Dict]:
     """
     从文章 URL 中提取 getappmsgext 需要的参数
     
-    URL 格式示例:
-    https://mp.weixin.qq.com/s?__biz=MzA3xxx==&mid=265xxx&idx=1&sn=abc123&...
+    支持两种格式:
+    - 短链接: https://mp.weixin.qq.com/s/XXXX（自动解析重定向）
+    - 完整链接: https://mp.weixin.qq.com/s?__biz=MzA3xxx==&mid=265xxx&idx=1&sn=abc123&...
     """
     try:
+        # 如果是短链接，先解析重定向
+        if "/s/" in url and "__biz" not in url:
+            url = _resolve_short_url(url)
+        
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
         
@@ -69,26 +103,26 @@ def _parse_article_url(url: str) -> Optional[Dict]:
         idx = params.get("idx", [None])[0]
         sn = params.get("sn", [None])[0]
         
-        # 有些短链接格式不同，尝试从 path 中提取
+        # 从完整URL中正则提取（兜底）
         if not _biz:
-            _biz_match = re.search(r'__biz=([^&]+)', url)
-            if _biz_match:
-                _biz = _biz_match.group(1)
+            m = re.search(r'__biz=([^&]+)', url)
+            if m:
+                _biz = m.group(1)
         
         if not mid:
-            mid_match = re.search(r'mid=(\d+)', url)
-            if mid_match:
-                mid = mid_match.group(1)
+            m = re.search(r'mid=(\d+)', url)
+            if m:
+                mid = m.group(1)
         
         if not idx:
-            idx_match = re.search(r'idx=(\d+)', url)
-            if idx_match:
-                idx = idx_match.group(1)
+            m = re.search(r'idx=(\d+)', url)
+            if m:
+                idx = m.group(1)
         
         if not sn:
-            sn_match = re.search(r'sn=([^&]+)', url)
-            if sn_match:
-                sn = sn_match.group(1)
+            m = re.search(r'sn=([^&]+)', url)
+            if m:
+                sn = m.group(1)
         
         if not all([_biz, mid, idx, sn]):
             return None
