@@ -12,6 +12,13 @@ from .base import success_response, error_response
 
 router = APIRouter(prefix="/reading", tags=["阅读量管理"])
 
+
+# ========== 简单连通测试 ==========
+@router.get("/ping", summary="连通测试")
+async def reading_ping():
+    """简单ping测试，确认reading路由已加载"""
+    return {"status": "ok", "message": "reading router is alive", "version": "v2-url-mapping"}
+
 # 后台任务管理
 _reading_tasks = {}
 _reading_tasks_lock = threading.Lock()
