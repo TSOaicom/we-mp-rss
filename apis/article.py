@@ -18,6 +18,12 @@ from core.article_content import sync_article_content
 from driver.wxarticle import WXArticleFetcher
 router = APIRouter(prefix=f"/articles", tags=["文章管理"])
 
+
+@router.get("/deploy-check", summary="部署检查")
+async def deploy_check():
+    """检查是否部署了最新代码"""
+    return {"status": "ok", "module": "article", "version": "v2-deploy-check", "ts": time.time()}
+
 _refresh_tasks = {}
 _refresh_tasks_lock = threading.Lock()
 
