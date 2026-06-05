@@ -1,9 +1,10 @@
 """
 阅读量 API 模块
-提供文章阅读量的获取和管理接口
+提供 Token 管理、文章阅读量获取和管理接口
 """
 import threading
 import json
+import time
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from core.auth import get_current_user_or_ak
 from core.db import DB
@@ -26,97 +27,110 @@ def _get_reading_task(task_id: str) -> dict:
         return _reading_tasks.get(task_id, {})
 
 
-@router.get("/article/{article_id}", summary="获取单篇文章阅读量")
-async def get_article_reading(
-    article_id: str,
+# ========== Token 管理 ==========
+
+@router.post("/token", summary="上传微信移动端 Token")
+async def upload_mobile_token(
+    key: str = Body(..., description="从 Fiddler getappmsgext 请求的 query 参数中获取"),
+    pass_ticket: str = Body(..., description="从 Fiddler getappmsgext 请求的 query 参数中获取"),
+    appmsg_token: str = Body(..., description="从 Fiddler getappmsgext 请求的 query 参数中获取"),
+    uin: str = Body(..., description="从 Fiddler getappmsgext 请求的 query 参数中获取"),
+    cookie: str = Body("", description="从 Fiddler getappmsgext 请求的 Cookie header 中获取（可选）"),
     current_user: dict = Depends(get_current_user_or_ak)
 ):
-    """获取单篇文章的阅读量数据"""
-    session = DB.get_session()
-    try:
-        from core.models.article import Article
-        article = session.query(Article).filter(Article.id == article_id).first()
-        if not article:
-            raise HTTPException(status_code=404, detail=error_response(40401, "文章不存在"))
-        
-        if not article.url:
-            return error_response(40001, "文章无URL，无法获取阅读量")
-        
-        # 检查是否已有阅读量数据
-        existing_stats = None
-        try:
-            publish_info = json.loads(article.publish_info) if article.publish_info else {}
-            existing_stats = publish_info.get("reading_stats")
-        except (json.JSONDecodeError, TypeError):
-            pass
-        
-        # 异步获取阅读量
-        import asyncio
-        from core.reading_count import capture_reading_count, save_reading_counts_to_db
-        
-        reading_data = await capture_reading_count(article.url)
-        
-        if reading_data.get("read_num") is not None:
-            save_reading_counts_to_db(article_id, reading_data)
-            return success_response({
-                "article_id": article_id,
-                "title": article.title,
-                "read_num": reading_data.get("read_num"),
-                "like_num": reading_data.get("like_num"),
-                "old_like_num": reading_data.get("old_like_num"),
-                "source": "live"
-            })
-        elif existing_stats:
-            return success_response({
-                "article_id": article_id,
-                "title": article.title,
-                "read_num": existing_stats.get("read_num"),
-                "like_num": existing_stats.get("like_num"),
-                "old_like_num": existing_stats.get("old_like_num"),
-                "source": "cached",
-                "updated_at": existing_stats.get("updated_at")
-            })
-        else:
-            return success_response({
-                "article_id": article_id,
-                "title": article.title,
-                "read_num": None,
-                "like_num": None,
-                "old_like_num": None,
-                "message": reading_data.get("error", "未能获取阅读量"),
-                "source": "none"
-            })
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"获取阅读量错误: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_201_CREATED,
-            detail=error_response(50001, f"获取阅读量失败: {str(e)}")
-        )
+    """
+    上传微信移动端 Token（从 Fiddler 抓包获取）
+    
+    操作步骤：
+    1. 电脑安装 Fiddler，手机和电脑连同一 WiFi
+    2. 手机 WiFi 设置 HTTP 代理指向 Fiddler
+    3. 手机微信打开任意一篇公众号文章
+    4. 在 Fiddler 中找到 mp.weixin.qq.com/mp/getappmsgext 请求
+    5. 从 URL query 参数中复制 key、pass_ticket、appmsg_token、uin
+    6. 从请求头中复制 Cookie（可选，提高成功率）
+    """
+    from core.wx_reading_fetcher import set_mobile_tokens
+    
+    result = set_mobile_tokens(
+        key=key,
+        pass_ticket=pass_ticket,
+        appmsg_token=appmsg_token,
+        uin=uin,
+        cookie=cookie
+    )
+    
+    return success_response({
+        **result,
+        "message": "Token 已保存，可以开始批量获取阅读量。Token 有效期通常为数小时。"
+    })
 
+
+@router.get("/token/status", summary="查看 Token 状态")
+async def get_token_status(
+    current_user: dict = Depends(get_current_user_or_ak)
+):
+    """查看当前微信移动端 Token 的状态"""
+    from core.wx_reading_fetcher import get_token_status
+    return success_response(get_token_status())
+
+
+@router.post("/token/test", summary="测试 Token 是否有效")
+async def test_token(
+    test_url: str = Body(..., description="任意一篇微信文章的URL，用于测试Token有效性"),
+    current_user: dict = Depends(get_current_user_or_ak)
+):
+    """用一篇已知文章URL测试Token是否有效"""
+    from core.wx_reading_fetcher import fetch_reading_count
+    
+    result = fetch_reading_count(test_url)
+    
+    if result.get("read_num") is not None:
+        return success_response({
+            "valid": True,
+            "read_num": result["read_num"],
+            "like_num": result.get("like_num"),
+            "old_like_num": result.get("old_like_num"),
+            "message": "Token 有效！可以开始批量获取阅读量。"
+        })
+    else:
+        return success_response({
+            "valid": False,
+            "error": result.get("error", "获取失败"),
+            "message": "Token 无效或已过期，请重新从 Fiddler 抓包获取。"
+        })
+
+
+# ========== 批量阅读量获取 ==========
 
 @router.post("/batch", summary="批量获取公众号文章阅读量")
 async def batch_get_reading(
     mp_id: str = Body(..., description="公众号ID"),
-    max_articles: int = Body(20, description="最多获取文章数", ge=1, le=100),
+    max_articles: int = Body(100, description="最多获取文章数", ge=1, le=500),
     current_user: dict = Depends(get_current_user_or_ak)
 ):
-    """批量获取指定公众号文章的阅读量（后台异步执行）"""
+    """
+    批量获取指定公众号文章的阅读量（后台异步执行）
+    
+    需要先通过 /token 接口上传微信移动端 Token
+    """
     import uuid
+    from core.wx_reading_fetcher import get_token_status
+    
+    # 检查 Token
+    token_status = get_token_status()
+    if not token_status["has_token"]:
+        return error_response(40002, "未设置微信移动端Token，请先通过 POST /api/v1/wx/reading/token 上传")
     
     session = DB.get_session()
     try:
         from core.models.article import Article
         from core.models.feed import Feed
         
-        # 检查公众号是否存在
         feed = session.query(Feed).filter(Feed.id == mp_id).first()
         if not feed:
             raise HTTPException(status_code=404, detail=error_response(40401, "公众号不存在"))
         
-        # 获取最近的文章（没有阅读量数据的优先）
+        # 获取文章（优先获取没有阅读量数据的）
         articles = session.query(Article).filter(
             Article.mp_id == mp_id,
             Article.url != None,
@@ -141,10 +155,15 @@ async def batch_get_reading(
             "created_at": __import__('datetime').datetime.now().isoformat()
         })
         
+        # 准备文章数据（在 session 关闭前取出）
+        article_data = [
+            {"id": a.id, "url": a.url, "title": a.title[:60]}
+            for a in articles
+        ]
+        
         # 启动后台线程执行
         def run_batch_task():
-            import asyncio
-            asyncio.run(_run_batch_reading_task(task_id, articles))
+            _run_batch_reading_task_sync(task_id, article_data)
         
         thread = threading.Thread(target=run_batch_task, daemon=True)
         thread.start()
@@ -155,7 +174,7 @@ async def batch_get_reading(
             "mp_name": feed.mp_name,
             "total_articles": len(articles),
             "status": "running",
-            "message": f"已开始获取 {len(articles)} 篇文章的阅读量"
+            "message": f"已开始获取 {len(articles)} 篇文章的阅读量，通过 GET /api/v1/wx/reading/task/{{task_id}} 查看进度"
         })
         
     except HTTPException:
@@ -167,57 +186,153 @@ async def batch_get_reading(
         )
 
 
-async def _run_batch_reading_task(task_id: str, articles):
-    """后台执行批量阅读量获取"""
-    from core.reading_count import capture_reading_count, save_reading_counts_to_db
+@router.post("/batch/all", summary="批量获取所有公众号文章阅读量")
+async def batch_get_all_reading(
+    max_articles_per_mp: int = Body(50, description="每个公众号最多获取文章数", ge=1, le=200),
+    current_user: dict = Depends(get_current_user_or_ak)
+):
+    """
+    批量获取所有公众号文章的阅读量（后台异步执行）
+    
+    会遍历所有已订阅的公众号，逐个获取文章阅读量。
+    需要先通过 /token 接口上传微信移动端 Token。
+    """
+    import uuid
+    from core.wx_reading_fetcher import get_token_status
+    
+    token_status = get_token_status()
+    if not token_status["has_token"]:
+        return error_response(40002, "未设置微信移动端Token，请先通过 POST /api/v1/wx/reading/token 上传")
+    
+    session = DB.get_session()
+    try:
+        from core.models.article import Article
+        from core.models.feed import Feed
+        
+        feeds = session.query(Feed).filter(Feed.status == 1).all()
+        
+        all_articles = []
+        for feed in feeds:
+            articles = session.query(Article).filter(
+                Article.mp_id == feed.id,
+                Article.url != None,
+                Article.url != ""
+            ).order_by(Article.publish_time.desc()).limit(max_articles_per_mp).all()
+            
+            for a in articles:
+                all_articles.append({
+                    "id": a.id,
+                    "url": a.url,
+                    "title": a.title[:60],
+                    "mp_id": feed.id,
+                    "mp_name": feed.mp_name,
+                })
+        
+        if not all_articles:
+            return error_response(40001, "没有可获取阅读量的文章")
+        
+        task_id = str(uuid.uuid4())
+        _set_reading_task(task_id, {
+            "task_id": task_id,
+            "mp_id": "all",
+            "mp_name": "全部公众号",
+            "total": len(all_articles),
+            "processed": 0,
+            "success": 0,
+            "failed": 0,
+            "status": "running",
+            "results": [],
+            "created_at": __import__('datetime').datetime.now().isoformat()
+        })
+        
+        def run_all_task():
+            _run_batch_reading_task_sync(task_id, all_articles)
+        
+        thread = threading.Thread(target=run_all_task, daemon=True)
+        thread.start()
+        
+        return success_response({
+            "task_id": task_id,
+            "total_mps": len(feeds),
+            "total_articles": len(all_articles),
+            "status": "running",
+            "message": f"已开始获取 {len(feeds)} 个公众号共 {len(all_articles)} 篇文章的阅读量"
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_201_CREATED,
+            detail=error_response(50001, f"启动批量获取失败: {str(e)}")
+        )
+
+
+def _run_batch_reading_task_sync(task_id: str, article_data: list):
+    """同步方式执行批量阅读量获取（在线程中运行）"""
+    from core.wx_reading_fetcher import fetch_reading_count, save_reading_to_db
     
     task = _get_reading_task(task_id)
     results = []
+    consecutive_errors = 0
     
-    for i, article in enumerate(articles):
+    for i, article in enumerate(article_data):
         try:
-            reading_data = await capture_reading_count(article.url, timeout=15000)
+            reading_result = fetch_reading_count(article["url"])
             
-            if reading_data.get("read_num") is not None:
-                save_reading_counts_to_db(article.id, reading_data)
+            if reading_result.get("read_num") is not None:
+                # 保存到数据库
+                save_reading_to_db(article["id"], reading_result)
+                
                 results.append({
-                    "article_id": article.id,
-                    "title": article.title[:50],
-                    "read_num": reading_data["read_num"],
-                    "like_num": reading_data.get("like_num"),
+                    "article_id": article["id"],
+                    "title": article.get("title", ""),
+                    "read_num": reading_result["read_num"],
+                    "like_num": reading_result.get("like_num"),
+                    "old_like_num": reading_result.get("old_like_num"),
                     "status": "success"
                 })
                 task["success"] += 1
+                consecutive_errors = 0
             else:
+                err = reading_result.get("error", "未知")
                 results.append({
-                    "article_id": article.id,
-                    "title": article.title[:50],
+                    "article_id": article["id"],
+                    "title": article.get("title", ""),
                     "read_num": None,
-                    "error": reading_data.get("error", "未知"),
+                    "error": err,
                     "status": "failed"
                 })
                 task["failed"] += 1
+                consecutive_errors += 1
+                
+                # 如果连续多次Token过期错误，停止任务
+                if "过期" in err or consecutive_errors >= 10:
+                    task["status"] = "stopped"
+                    task["error"] = f"连续 {consecutive_errors} 次失败，任务已自动停止。原因: {err}"
+                    with _reading_tasks_lock:
+                        _reading_tasks[task_id] = {**task, "results": results}
+                    return
                 
         except Exception as e:
             results.append({
-                "article_id": article.id,
-                "title": article.title[:50],
+                "article_id": article["id"],
+                "title": article.get("title", ""),
                 "read_num": None,
                 "error": str(e),
                 "status": "error"
             })
             task["failed"] += 1
+            consecutive_errors += 1
         
         task["processed"] = i + 1
         
-        # 更新任务状态
         with _reading_tasks_lock:
             _reading_tasks[task_id] = {**task, "results": results}
         
-        # 请求间隔，避免频率限制
-        if i < len(articles) - 1:
-            import asyncio as _asyncio
-            await _asyncio.sleep(5)
+        # 请求间隔，避免被限流
+        if i < len(article_data) - 1:
+            time.sleep(3)
     
     # 完成
     with _reading_tasks_lock:
@@ -225,16 +340,75 @@ async def _run_batch_reading_task(task_id: str, articles):
         _reading_tasks[task_id]["results"] = results
 
 
+# ========== 查询接口 ==========
+
 @router.get("/task/{task_id}", summary="查询批量获取任务状态")
 async def get_reading_task_status(
     task_id: str,
     current_user: dict = Depends(get_current_user_or_ak)
 ):
-    """查询批量获取阅读量任务的状态"""
+    """查询批量获取阅读量任务的状态和进度"""
     task = _get_reading_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=error_response(40404, "任务不存在"))
-    return success_response(task)
+    
+    # 返回状态（不含完整结果列表，减少响应大小）
+    summary = {**task}
+    if len(summary.get("results", [])) > 20:
+        summary["results"] = summary["results"][:20]
+        summary["results_truncated"] = True
+    
+    return success_response(summary)
+
+
+@router.get("/article/{article_id}", summary="获取单篇文章阅读量")
+async def get_article_reading(
+    article_id: str,
+    current_user: dict = Depends(get_current_user_or_ak)
+):
+    """获取单篇文章的阅读量数据（从数据库读取已缓存的数据）"""
+    session = DB.get_session()
+    try:
+        from core.models.article import Article
+        article = session.query(Article).filter(Article.id == article_id).first()
+        if not article:
+            raise HTTPException(status_code=404, detail=error_response(40401, "文章不存在"))
+        
+        existing_stats = None
+        try:
+            publish_info = json.loads(article.publish_info) if article.publish_info else {}
+            existing_stats = publish_info.get("reading_stats")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        
+        if existing_stats:
+            return success_response({
+                "article_id": article_id,
+                "title": article.title,
+                "read_num": existing_stats.get("read_num"),
+                "like_num": existing_stats.get("like_num"),
+                "old_like_num": existing_stats.get("old_like_num"),
+                "updated_at": existing_stats.get("updated_at"),
+                "source": "cached"
+            })
+        else:
+            return success_response({
+                "article_id": article_id,
+                "title": article.title,
+                "read_num": None,
+                "like_num": None,
+                "old_like_num": None,
+                "message": "暂无阅读量数据",
+                "source": "none"
+            })
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_201_CREATED,
+            detail=error_response(50001, f"获取阅读量失败: {str(e)}")
+        )
 
 
 @router.get("/stats/{mp_id}", summary="获取公众号文章阅读量统计")
@@ -304,10 +478,8 @@ async def get_reading_overview(
     session = DB.get_session()
     try:
         from core.models.article import Article
-        from core.models.feed import Feed
         from sqlalchemy import func
         
-        # 获取有阅读量数据的文章统计
         articles_with_stats = session.query(Article).filter(
             Article.publish_info != None,
             Article.publish_info != "{}",
@@ -332,7 +504,6 @@ async def get_reading_overview(
             except (json.JSONDecodeError, TypeError):
                 continue
         
-        # 总文章数
         total_articles = session.query(func.count(Article.id)).scalar() or 0
         
         return success_response({
