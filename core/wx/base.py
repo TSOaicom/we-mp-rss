@@ -238,6 +238,8 @@ class WxGather:
                 }
                 if 'digest' in data:
                     art['description']=data['digest']
+                if 'extinfo' in data and data['extinfo']:
+                    art['extinfo']=data['extinfo']
                 if CallBack(art):
                     art["ext"]=Ext_Data
                     # art.pop("content")

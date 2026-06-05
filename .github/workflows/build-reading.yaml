@@ -10,6 +10,9 @@ on:
     paths:
       - 'apis/reading.py'
       - 'core/reading_count.py'
+      - 'core/wx_reading_fetcher.py'
+      - 'core/wx/model/web.py'
+      - 'core/wx/base.py'
 
 jobs:
   build-and-push:

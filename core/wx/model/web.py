@@ -106,6 +106,25 @@ class MpsWeb(WxGather):
                                     item["publish_info"] = publish_info.get("publish_info","")
                                     item["id"] = item["aid"]
                                     item["mp_id"] = Mps_id
+                                    # 存储 appmsgex 完整元数据到 extinfo（用于阅读量参数获取）
+                                    try:
+                                        ext_data = {
+                                            "appmsgex_keys": list(item.keys()),
+                                            "aid": item.get("aid", ""),
+                                            "link": item.get("link", ""),
+                                            "appmsgid": item.get("appmsgid", ""),
+                                            "content_url": item.get("content_url", ""),
+                                            "msg_link": item.get("msg_link", ""),
+                                            "old_link": item.get("old_link", ""),
+                                            "source_url": item.get("source_url", ""),
+                                        }
+                                        # 存储任何看起来像URL的字段
+                                        for k, v in item.items():
+                                            if isinstance(v, str) and ('http' in v[:10] or 'mp.weixin' in v):
+                                                ext_data[f"raw_{k}"] = v[:500]
+                                        item["extinfo"] = json.dumps(ext_data, ensure_ascii=False)
+                                    except Exception:
+                                        pass
                                     if CallBack is not None:
                                         super().FillBack(CallBack=CallBack,data=item,Ext_Data={"mp_title":Mps_title,"mp_id":Mps_id})
                     print(f"第{i+1}页爬取成功\n")

@@ -1,19 +1,26 @@
 """
 微信阅读量直接获取模块
 通过 Fiddler 抓包获取的移动端 Token 直接调用 getappmsgext API
-支持短链接自动解析（Playwright fallback）
+
+URL 参数获取策略（按优先级）：
+1. URL映射表（用户手动上传完整URL）
+2. URL中直接提取（如果已经是完整URL）
+3. HTTP重定向跟踪（多种UA策略）
+4. 验证码页面HTML解析（提取嵌入的重定向URL）
+5. extinfo中存储的元数据（从 appmsgpublish API 采集时保存）
 """
 import asyncio
 import json
 import re
 import time
 import requests
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 
-# Token 存储（运行时保存在内存中）
+# ========== Token 管理 ==========
+
 _wx_mobile_tokens = {
     "key": "",
     "pass_ticket": "",
@@ -23,8 +30,41 @@ _wx_mobile_tokens = {
     "updated_at": None,
 }
 
-# URL参数缓存（避免重复解析同一篇文章）
+# URL 参数缓存
 _url_params_cache = {}
+
+# URL 映射表：短链接 -> 完整URL参数
+# 持久化到文件以避免重启丢失
+_url_mapping_file = "/app/data/url_mapping.json"
+_url_mapping = {}
+
+
+def _load_url_mapping():
+    """从文件加载URL映射"""
+    global _url_mapping
+    try:
+        import os
+        if os.path.exists(_url_mapping_file):
+            with open(_url_mapping_file, 'r', encoding='utf-8') as f:
+                _url_mapping = json.load(f)
+    except Exception as e:
+        print(f"加载URL映射失败: {e}")
+        _url_mapping = {}
+
+
+def _save_url_mapping():
+    """保存URL映射到文件"""
+    try:
+        import os
+        os.makedirs(os.path.dirname(_url_mapping_file), exist_ok=True)
+        with open(_url_mapping_file, 'w', encoding='utf-8') as f:
+            json.dump(_url_mapping, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存URL映射失败: {e}")
+
+
+# 启动时加载映射
+_load_url_mapping()
 
 
 def set_mobile_tokens(key: str, pass_ticket: str, appmsg_token: str, uin: str, cookie: str = "") -> Dict:
@@ -49,8 +89,87 @@ def get_token_status() -> Dict:
         "updated_at": _wx_mobile_tokens.get("updated_at"),
         "key_preview": _wx_mobile_tokens["key"][:8] + "..." if has_token else "",
         "uin": _wx_mobile_tokens.get("uin", "")[:6] + "..." if _wx_mobile_tokens.get("uin") else "",
+        "url_mapping_count": len(_url_mapping),
     }
 
+
+# ========== URL 映射管理 ==========
+
+def add_url_mapping(short_url: str, full_url: str) -> bool:
+    """
+    添加 URL 映射（短链接 -> 完整URL）
+    
+    Args:
+        short_url: 短链接，如 https://mp.weixin.qq.com/s/XXXX
+        full_url: 完整URL，包含 __biz, mid, idx, sn 参数
+    """
+    params = _extract_params_from_url(full_url)
+    if not params:
+        return False
+    
+    # 提取短链接的关键部分
+    key = _normalize_short_url(short_url)
+    _url_mapping[key] = {
+        "full_url": full_url,
+        "params": params,
+        "added_at": datetime.now().isoformat(),
+    }
+    _save_url_mapping()
+    return True
+
+
+def add_url_mapping_batch(mappings: List[Dict]) -> Tuple[int, int]:
+    """
+    批量添加 URL 映射
+    
+    Args:
+        mappings: [{"short_url": "...", "full_url": "..."}, ...]
+    
+    Returns:
+        (成功数, 失败数)
+    """
+    success = 0
+    failed = 0
+    for m in mappings:
+        if add_url_mapping(m.get("short_url", ""), m.get("full_url", "")):
+            success += 1
+        else:
+            failed += 1
+    return success, failed
+
+
+def get_url_mapping_stats() -> Dict:
+    """获取 URL 映射统计"""
+    return {
+        "total": len(_url_mapping),
+        "sample": list(_url_mapping.keys())[:5],
+    }
+
+
+def _normalize_short_url(url: str) -> str:
+    """标准化短链接，提取 /s/ 后面的部分"""
+    m = re.search(r'/s/([A-Za-z0-9_-]+)', url)
+    if m:
+        return f"/s/{m.group(1)}"
+    # 如果已经是完整URL，用完整URL作为key
+    return url
+
+
+def _lookup_url_mapping(url: str) -> Optional[Dict]:
+    """查找URL映射"""
+    key = _normalize_short_url(url)
+    mapping = _url_mapping.get(key)
+    if mapping:
+        return mapping.get("params")
+    
+    # 尝试完整URL匹配
+    if url in _url_mapping:
+        return _url_mapping[url].get("params")
+    
+    return None
+
+
+# ========== URL 参数提取 ==========
 
 def _extract_params_from_url(url: str) -> Optional[Dict]:
     """从URL中提取 __biz, mid, idx, sn 参数"""
@@ -84,154 +203,347 @@ def _extract_params_from_url(url: str) -> Optional[Dict]:
         return None
 
 
-async def resolve_url_with_playwright(url: str) -> Optional[Dict]:
+def _extract_from_captcha_html(html: str) -> Optional[str]:
     """
-    用 Playwright 加载文章页面，提取 __biz, mid, idx, sn 参数
+    从微信验证码页面 HTML 中提取目标文章URL
     
-    微信短链接 /s/XXXX 会跳转到验证页面，HTTP方式无法获取完整URL。
-    Playwright 使用真实浏览器加载页面，可以从页面JS变量中提取参数。
+    微信验证码页面通常包含：
+    1. meta refresh 标签指向目标URL
+    2. JavaScript 中的重定向URL
+    3. 隐藏表单字段
     """
-    try:
-        from playwright.async_api import async_playwright
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.38",
-                viewport={"width": 375, "height": 812}
-            )
-            page = await context.new_page()
-
-            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(5000)
-
-            params = await page.evaluate("""
-                () => {
-                    const result = {};
-                    // 从全局变量获取
-                    if (typeof window.__biz !== 'undefined') result.__biz = window.__biz;
-                    if (typeof window.appmsgid !== 'undefined') result.mid = String(window.appmsgid);
-                    if (typeof window.idx !== 'undefined') result.idx = String(window.idx);
-                    if (typeof window.sn !== 'undefined') result.sn = window.sn;
-                    
-                    // 从 var 声明中提取
-                    const html = document.documentElement.innerHTML;
-                    if (!result.__biz) {
-                        const m = html.match(/var\\s+biz\\s*=\\s*["']([^"']+)["']/);
-                        if (m) result.__biz = m[1];
-                    }
-                    if (!result.mid) {
-                        const m = html.match(/var\\s+appmsgid\\s*=\\s*["']?(\\d+)["']?/);
-                        if (m) result.mid = m[1];
-                    }
-                    if (!result.idx) {
-                        const m = html.match(/var\\s+idx\\s*=\\s*["']?(\\d+)["']?/);
-                        if (m) result.idx = m[1];
-                    }
-                    if (!result.sn) {
-                        const m = html.match(/var\\s+sn\\s*=\\s*["']([^"']+)["']/);
-                        if (m) result.sn = m[1];
-                    }
-                    
-                    // 从当前页面URL中提取
-                    const currentUrl = window.location.href;
-                    if (!result.__biz && currentUrl.includes('__biz=')) {
-                        const u = new URL(currentUrl);
-                        result.__biz = u.searchParams.get('__biz') || '';
-                        result.mid = u.searchParams.get('mid') || '';
-                        result.idx = u.searchParams.get('idx') || '';
-                        result.sn = u.searchParams.get('sn') || '';
-                    }
-                    
-                    result._url = currentUrl;
-                    return result;
-                }
-            """)
-
-            await browser.close()
-
-            if params and params.get("__biz") and params.get("mid") and params.get("sn"):
-                return {
-                    "__biz": params["__biz"],
-                    "mid": params["mid"],
-                    "idx": params.get("idx", "1"),
-                    "sn": params["sn"],
-                }
-
-            # 尝试从最终URL解析
-            if params and params.get("_url"):
-                return _extract_params_from_url(params["_url"])
-
-            return None
-
-    except Exception as e:
-        print(f"Playwright URL解析失败: {e}")
+    if not html:
         return None
-
-
-async def parse_article_url(url: str) -> Optional[Dict]:
-    """
-    解析文章URL获取 __biz, mid, idx, sn 参数（异步，带缓存）
     
-    处理流程:
-    1. 检查缓存
-    2. 如果URL已有参数，尝试 HTTP 重定向
-    3. 如果HTTP失败，用 Playwright 解析
+    # 从 meta refresh 提取
+    m = re.search(r'<meta[^>]*url=([^"\'>\s]+)', html, re.I)
+    if m:
+        target = unquote(m.group(1))
+        if '__biz' in target:
+            return target
+    
+    # 从 redirect_url / return_url 变量提取
+    patterns = [
+        r'redirect_url\s*[=:]\s*["\']([^"\']+)["\']',
+        r'return_url\s*[=:]\s*["\']([^"\']+)["\']',
+        r'next_url\s*[=:]\s*["\']([^"\']+)["\']',
+        r'target_url\s*[=:]\s*["\']([^"\']+)["\']',
+        r'window\.location\.href\s*=\s*["\']([^"\']+)["\']',
+        r'window\.location\.replace\s*\(\s*["\']([^"\']+)["\']',
+        r'window\.location\s*=\s*["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, re.I)
+        if m:
+            target = unquote(m.group(1))
+            if '__biz' in target:
+                return target
+    
+    # 从 data-url 属性提取
+    m = re.search(r'data-url=["\']([^"\']+)["\']', html)
+    if m:
+        target = unquote(m.group(1))
+        if '__biz' in target:
+            return target
+    
+    return None
+
+
+def _extract_biz_from_html(html: str) -> Optional[Dict]:
     """
-    # 检查缓存
+    从页面HTML中直接提取文章参数（即使页面被验证码拦截）
+    
+    微信文章页面的JS变量通常包含这些值
+    """
+    if not html:
+        return None
+    
+    result = {}
+    
+    # 提取 __biz
+    m = re.search(r'var\s+biz\s*=\s*["\']([^"\']+)["\']', html)
+    if m:
+        result["__biz"] = m.group(1)
+    else:
+        m = re.search(r'__biz=([^&"\'\\s]+)', html)
+        if m:
+            result["__biz"] = m.group(1)
+    
+    # 提取 appmsgid / mid
+    m = re.search(r'var\s+appmsgid\s*=\s*["\']?(\d+)["\']?', html)
+    if m:
+        result["mid"] = m.group(1)
+    else:
+        m = re.search(r'mid=(\d+)', html)
+        if m:
+            result["mid"] = m.group(1)
+    
+    # 提取 idx
+    m = re.search(r'var\s+idx\s*=\s*["\']?(\d+)["\']?', html)
+    if m:
+        result["idx"] = m.group(1)
+    else:
+        m = re.search(r'idx=(\d+)', html)
+        if m:
+            result["idx"] = m.group(1)
+    
+    # 提取 sn
+    m = re.search(r'var\s+sn\s*=\s*["\']([^"\']+)["\']', html)
+    if m:
+        result["sn"] = m.group(1)
+    else:
+        m = re.search(r'sn=([^&"\'\\s]+)', html)
+        if m:
+            result["sn"] = m.group(1)
+    
+    if all(k in result for k in ["__biz", "mid", "sn"]):
+        if "idx" not in result:
+            result["idx"] = "1"
+        return result
+    
+    return None
+
+
+# ========== HTTP URL 解析（多策略） ==========
+
+_MOBILE_UAS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.43(0x1800002b) NetType/WIFI Language/zh_CN",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.43 Mobile Safari/537.36 MicroMessenger/8.0.43",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.38",
+]
+
+_DESKTOP_UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+]
+
+
+def _resolve_url_http(url: str) -> Tuple[Optional[Dict], Dict]:
+    """
+    通过 HTTP 请求解析短链接（多策略）
+    
+    Returns:
+        (解析结果, 诊断信息)
+    """
+    diag = {
+        "strategies_tried": [],
+        "final_urls": [],
+        "captcha_detected": False,
+        "html_extracted": False,
+    }
+    
+    # 如果URL已经有参数，直接提取
+    if "__biz=" in url and "mid=" in url:
+        result = _extract_params_from_url(url)
+        if result:
+            return result, {"strategy": "direct"}
+    
+    # 策略1: 多种UA + GET请求跟踪重定向
+    for i, ua in enumerate(_MOBILE_UAS[:2]):
+        strategy_name = f"mobile_ua_{i}"
+        diag["strategies_tried"].append(strategy_name)
+        try:
+            resp = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=15,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                }
+            )
+            final_url = resp.url
+            diag["final_urls"].append({"strategy": strategy_name, "url": final_url[:200]})
+            
+            # 检查是否到达真实文章页
+            if "__biz=" in final_url:
+                result = _extract_params_from_url(final_url)
+                if result:
+                    return result, {"strategy": strategy_name}
+            
+            # 检查验证码页面
+            if "appmsgcaptcha" in final_url or "环境异常" in (resp.text or ""):
+                diag["captcha_detected"] = True
+                
+                # 尝试从验证码页面HTML提取参数
+                captcha_params = _extract_from_captcha_html(resp.text)
+                if captcha_params:
+                    result = _extract_params_from_url(captcha_params)
+                    if result:
+                        return result, {"strategy": f"{strategy_name}_captcha_redirect"}
+                
+                # 尝试直接从HTML提取参数
+                html_params = _extract_biz_from_html(resp.text)
+                if html_params:
+                    diag["html_extracted"] = True
+                    return html_params, {"strategy": f"{strategy_name}_html_extract"}
+            
+            # 如果响应200且没有验证码，尝试从HTML提取
+            if resp.status_code == 200 and "appmsgcaptcha" not in final_url:
+                html_params = _extract_biz_from_html(resp.text)
+                if html_params:
+                    return html_params, {"strategy": f"{strategy_name}_page_html"}
+                    
+        except Exception as e:
+            diag["strategies_tried"].append(f"{strategy_name}_error: {str(e)[:100]}")
+    
+    # 策略2: 桌面UA
+    for i, ua in enumerate(_DESKTOP_UAS[:1]):
+        strategy_name = f"desktop_ua_{i}"
+        diag["strategies_tried"].append(strategy_name)
+        try:
+            resp = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=15,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html",
+                }
+            )
+            final_url = resp.url
+            diag["final_urls"].append({"strategy": strategy_name, "url": final_url[:200]})
+            
+            if "__biz=" in final_url:
+                result = _extract_params_from_url(final_url)
+                if result:
+                    return result, {"strategy": strategy_name}
+            
+            if resp.status_code == 200:
+                html_params = _extract_biz_from_html(resp.text)
+                if html_params:
+                    return html_params, {"strategy": f"{strategy_name}_html"}
+                    
+        except Exception as e:
+            diag["strategies_tried"].append(f"{strategy_name}_error: {str(e)[:100]}")
+    
+    # 策略3: HEAD请求（不下载body，只看Location头）
+    diag["strategies_tried"].append("head_request")
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=10,
+                            headers={"User-Agent": _MOBILE_UAS[0]})
+        final_url = resp.url
+        diag["final_urls"].append({"strategy": "head", "url": final_url[:200]})
+        if "__biz=" in final_url:
+            result = _extract_params_from_url(final_url)
+            if result:
+                return result, {"strategy": "head_redirect"}
+    except Exception as e:
+        diag["strategies_tried"].append(f"head_error: {str(e)[:100]}")
+    
+    return None, diag
+
+
+# ========== 主入口：解析文章URL ==========
+
+async def parse_article_url(url: str) -> Tuple[Optional[Dict], Dict]:
+    """
+    解析文章URL获取 __biz, mid, idx, sn 参数
+    
+    处理流程（按优先级）：
+    1. 检查URL映射表
+    2. 检查缓存
+    3. 如果URL已有参数，直接提取
+    4. HTTP多策略解析
+    5. 从extinfo中读取（由调用者处理）
+    
+    Returns:
+        (解析结果, 诊断信息)
+    """
+    diag = {"url": url[:200], "steps": []}
+    
+    # 1. 检查URL映射表
+    mapped = _lookup_url_mapping(url)
+    if mapped:
+        diag["steps"].append("url_mapping_hit")
+        _url_params_cache[url] = mapped
+        return mapped, diag
+    
+    # 2. 检查缓存
+    if url in _url_params_cache:
+        diag["steps"].append("cache_hit")
+        return _url_params_cache[url], diag
+    
+    # 3. 如果URL已有完整参数
+    if "__biz=" in url and "mid=" in url:
+        result = _extract_params_from_url(url)
+        if result:
+            diag["steps"].append("direct_extract")
+            _url_params_cache[url] = result
+            return result, diag
+    
+    # 4. HTTP多策略解析
+    diag["steps"].append("http_resolve")
+    result, http_diag = _resolve_url_http(url)
+    diag["http_diag"] = http_diag
+    
+    if result:
+        _url_params_cache[url] = result
+        return result, diag
+    
+    # 5. 尝试从extinfo获取
+    diag["steps"].append("no_result")
+    return None, diag
+
+
+def parse_article_url_sync(url: str) -> Optional[Dict]:
+    """同步版本，用于批量任务"""
+    # 1. URL映射
+    mapped = _lookup_url_mapping(url)
+    if mapped:
+        return mapped
+    
+    # 2. 缓存
     if url in _url_params_cache:
         return _url_params_cache[url]
-
-    # 如果URL已有完整参数
+    
+    # 3. 直接提取
     if "__biz=" in url and "mid=" in url:
         result = _extract_params_from_url(url)
         if result:
             _url_params_cache[url] = result
             return result
-
-    # HTTP 方式尝试解析
-    try:
-        if "__biz=" not in url:
-            resp = requests.head(url, allow_redirects=True, timeout=10,
-                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-            final_url = resp.url
-            if "__biz=" in final_url:
-                result = _extract_params_from_url(final_url)
-                if result:
-                    _url_params_cache[url] = result
-                    return result
-    except Exception:
-        pass
-
-    # Playwright 方式解析
-    result = await resolve_url_with_playwright(url)
+    
+    # 4. HTTP解析
+    result, _ = _resolve_url_http(url)
     if result:
         _url_params_cache[url] = result
-    return result
+        return result
+    
+    return None
 
+
+# ========== 阅读量获取 ==========
 
 async def fetch_reading_count(url: str) -> Dict:
     """
     获取单篇文章的阅读量（异步）
     
     Returns:
-        {"read_num": int, "like_num": int, "old_like_num": int, "error": str}
+        {"read_num": int, "like_num": int, "old_like_num": int, "error": str, "diag": dict}
     """
     result = {
         "read_num": None,
         "like_num": None,
         "old_like_num": None,
-        "error": ""
+        "error": "",
+        "diag": {},
     }
 
     if not _wx_mobile_tokens.get("key"):
         result["error"] = "未设置微信移动端Token，请先通过 /api/v1/wx/reading/token 上传"
         return result
 
-    # 解析 URL（异步）
-    url_params = await parse_article_url(url)
+    # 解析 URL
+    url_params, parse_diag = await parse_article_url(url)
+    result["diag"] = parse_diag
+    
     if not url_params:
-        result["error"] = "无法从URL中解析文章参数（__biz, mid, idx, sn），Playwright解析也失败"
+        result["error"] = (
+            "无法从URL中解析文章参数（__biz, mid, idx, sn）。"
+            "请通过 /api/v1/wx/reading/url-mapping 上传完整文章URL映射。"
+        )
         return result
 
     try:
@@ -333,3 +645,99 @@ def save_reading_to_db(article_id: str, reading_data: Dict) -> bool:
         return False
     finally:
         session.close()
+
+
+# ========== extinfo 管理 ==========
+
+def get_article_extinfo(article_id: str) -> Optional[Dict]:
+    """从数据库读取文章的 extinfo 字段"""
+    from core.db import DB
+    from core.models.article import Article
+    
+    session = DB.get_session()
+    try:
+        article = session.query(Article).filter(Article.id == article_id).first()
+        if not article or not article.extinfo:
+            return None
+        return json.loads(article.extinfo)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    finally:
+        session.close()
+
+
+def get_url_params_from_extinfo(article_id: str) -> Optional[Dict]:
+    """从 extinfo 中获取 URL 参数"""
+    ext = get_article_extinfo(article_id)
+    if not ext:
+        return None
+    params = ext.get("url_params")
+    if params and all(k in params for k in ["__biz", "mid", "sn"]):
+        if "idx" not in params:
+            params["idx"] = "1"
+        return params
+    return None
+
+
+def save_url_params_to_extinfo(article_id: str, params: Dict) -> bool:
+    """将 URL 参数保存到 extinfo"""
+    from core.db import DB
+    from core.models.article import Article
+    
+    session = DB.get_session()
+    try:
+        article = session.query(Article).filter(Article.id == article_id).first()
+        if not article:
+            return False
+        
+        try:
+            extinfo = json.loads(article.extinfo) if article.extinfo else {}
+        except (json.JSONDecodeError, TypeError):
+            extinfo = {}
+        
+        extinfo["url_params"] = params
+        article.extinfo = json.dumps(extinfo, ensure_ascii=False)
+        article.updated_at = int(time.time())
+        session.commit()
+        return True
+    except Exception as e:
+        session.rollback()
+        print(f"保存extinfo失败: {e}")
+        return False
+    finally:
+        session.close()
+
+
+# ========== 诊断工具 ==========
+
+def diagnose_url_resolution(url: str) -> Dict:
+    """同步诊断URL解析过程"""
+    result = {
+        "url": url[:200],
+        "steps": [],
+    }
+    
+    # 1. URL映射
+    mapped = _lookup_url_mapping(url)
+    if mapped:
+        result["steps"].append({"step": "url_mapping", "status": "found", "params": mapped})
+        return result
+    result["steps"].append({"step": "url_mapping", "status": "not_found"})
+    
+    # 2. 直接提取
+    if "__biz=" in url and "mid=" in url:
+        params = _extract_params_from_url(url)
+        if params:
+            result["steps"].append({"step": "direct_extract", "status": "found", "params": params})
+            return result
+    
+    # 3. HTTP解析
+    params, http_diag = _resolve_url_http(url)
+    result["steps"].append({
+        "step": "http_resolve",
+        "status": "found" if params else "not_found",
+        "params": params,
+        "diag": http_diag,
+    })
+    
+    return result
