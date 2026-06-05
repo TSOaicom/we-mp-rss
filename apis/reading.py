@@ -269,75 +269,76 @@ async def batch_get_all_reading(
 
 
 def _run_batch_reading_task_sync(task_id: str, article_data: list):
-    """同步方式执行批量阅读量获取（在线程中运行）"""
+    """异步方式执行批量阅读量获取（在线程中运行 async event loop）"""
+    import asyncio
     from core.wx_reading_fetcher import fetch_reading_count, save_reading_to_db
     
-    task = _get_reading_task(task_id)
-    results = []
-    consecutive_errors = 0
-    
-    for i, article in enumerate(article_data):
-        try:
-            reading_result = fetch_reading_count(article["url"])
-            
-            if reading_result.get("read_num") is not None:
-                # 保存到数据库
-                save_reading_to_db(article["id"], reading_result)
+    async def _run():
+        task = _get_reading_task(task_id)
+        results = []
+        consecutive_errors = 0
+        
+        for i, article in enumerate(article_data):
+            try:
+                reading_result = await fetch_reading_count(article["url"])
                 
-                results.append({
-                    "article_id": article["id"],
-                    "title": article.get("title", ""),
-                    "read_num": reading_result["read_num"],
-                    "like_num": reading_result.get("like_num"),
-                    "old_like_num": reading_result.get("old_like_num"),
-                    "status": "success"
-                })
-                task["success"] += 1
-                consecutive_errors = 0
-            else:
-                err = reading_result.get("error", "未知")
+                if reading_result.get("read_num") is not None:
+                    save_reading_to_db(article["id"], reading_result)
+                    
+                    results.append({
+                        "article_id": article["id"],
+                        "title": article.get("title", ""),
+                        "read_num": reading_result["read_num"],
+                        "like_num": reading_result.get("like_num"),
+                        "old_like_num": reading_result.get("old_like_num"),
+                        "status": "success"
+                    })
+                    task["success"] += 1
+                    consecutive_errors = 0
+                else:
+                    err = reading_result.get("error", "未知")
+                    results.append({
+                        "article_id": article["id"],
+                        "title": article.get("title", ""),
+                        "read_num": None,
+                        "error": err,
+                        "status": "failed"
+                    })
+                    task["failed"] += 1
+                    consecutive_errors += 1
+                    
+                    if "过期" in err or consecutive_errors >= 10:
+                        task["status"] = "stopped"
+                        task["error"] = f"连续 {consecutive_errors} 次失败，任务已自动停止。原因: {err}"
+                        with _reading_tasks_lock:
+                            _reading_tasks[task_id] = {**task, "results": results}
+                        return
+                    
+            except Exception as e:
                 results.append({
                     "article_id": article["id"],
                     "title": article.get("title", ""),
                     "read_num": None,
-                    "error": err,
-                    "status": "failed"
+                    "error": str(e),
+                    "status": "error"
                 })
                 task["failed"] += 1
                 consecutive_errors += 1
-                
-                # 如果连续多次Token过期错误，停止任务
-                if "过期" in err or consecutive_errors >= 10:
-                    task["status"] = "stopped"
-                    task["error"] = f"连续 {consecutive_errors} 次失败，任务已自动停止。原因: {err}"
-                    with _reading_tasks_lock:
-                        _reading_tasks[task_id] = {**task, "results": results}
-                    return
-                
-        except Exception as e:
-            results.append({
-                "article_id": article["id"],
-                "title": article.get("title", ""),
-                "read_num": None,
-                "error": str(e),
-                "status": "error"
-            })
-            task["failed"] += 1
-            consecutive_errors += 1
-        
-        task["processed"] = i + 1
+            
+            task["processed"] = i + 1
+            
+            with _reading_tasks_lock:
+                _reading_tasks[task_id] = {**task, "results": results}
+            
+            # 请求间隔
+            if i < len(article_data) - 1:
+                await asyncio.sleep(3)
         
         with _reading_tasks_lock:
-            _reading_tasks[task_id] = {**task, "results": results}
-        
-        # 请求间隔，避免被限流
-        if i < len(article_data) - 1:
-            time.sleep(3)
+            _reading_tasks[task_id]["status"] = "completed"
+            _reading_tasks[task_id]["results"] = results
     
-    # 完成
-    with _reading_tasks_lock:
-        _reading_tasks[task_id]["status"] = "completed"
-        _reading_tasks[task_id]["results"] = results
+    asyncio.run(_run())
 
 
 # ========== 查询接口 ==========
